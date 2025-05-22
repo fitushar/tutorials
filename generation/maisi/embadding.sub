@@ -1,0 +1,50 @@
+#!/bin/bash
+
+#SBATCH --job-name=Embadding
+#SBATCH --mail-type=END,FAIL    
+#SBATCH --mail-user=ft42@duke.edu
+#SBATCH -w node001
+#SBATCH --ntasks=1  #
+#SBATCH --gpus=2           # 2 GPU per task, chose more if model is capable of multi gpu training
+#SBATCH --cpus-per-task=16 # More if it is CPU intensive job too NNUNET demands lot of CPU
+
+## Make sure logs directory is present on current directory (same as this script)
+#SBATCH --output=logs/log-%j.out
+#SBATCH --error=logs/error-%j.out
+
+free_port=$(comm -23 <(seq 8000 65535 | sort) <(ss -tan | awk '{print $4}' | cut -d':' -f2 | grep -oE "[0-9]+" | sort -u) | head -n 1)
+
+export MASTER_PORT=${free_port}
+export WORLD_SIZE=$(($SLURM_NNODES * $SLURM_NTASKS_PER_NODE))
+echo "WORLD_SIZE="$WORLD_SIZE
+
+master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_ADDR=$master_addr
+echo "MASTER_ADDR="$MASTER_ADDR
+
+
+
+echo "Job starting"
+echo "GPUs Given:   $CUDA_VISIBLE_DEVICES"
+module load miniconda/py39_4.12.0
+source activate monai-auto3dseg
+
+# Add the correct path to PYTHONPATH
+## export PYTHONPATH=$PYTHONPATH:/home/ft42/Maisi/maisi/
+## export MONAI_DATA_DIRECTORY=/home/ft42/Maisi/maisi/
+## export MONAI_DATA_DIRECTORY=/scratch/railabs/ft42/VLST_Project/Data
+
+export PYTHONPATH=$PYTHONPATH:/home/ft42/Maisi/maisi/
+export PYTHONPATH=$PYTHONPATH:/scratch/railabs/ft42/VLST_Project/Data
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+
+echo "GPUs Given:   $CUDA_VISIBLE_DEVICES"
+
+export NUM_GPUS_PER_NODE=$CUDA_VISIBLE_DEVICES
+torchrun \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    --master_addr=localhost --master_port=1234 \
+    -m scripts.diff_model_create_training_data --env_config ./configs/NSCLCRadiomics_512xy_256z_771p25m_embeddings.json --model_config ./configs/config_maisi_diff_512xy_256z_771p25_model.json --model_def ./configs/config_maisi.json --num_gpus 4
+
