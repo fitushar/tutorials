@@ -24,7 +24,13 @@ from monai.transforms import SaveImage
 from monai.utils import RankFilter
 
 from .sample import check_input, ldm_conditional_sample_one_image
-from .utils import define_instance, prepare_maisi_controlnet_json_dataloader, setup_ddp
+from .utils import (
+    define_instance,
+    prepare_maisi_controlnet_json_dataloader,
+    setup_ddp,
+    get_body_region_index_from_mask,
+)
+from .prompt_to_mask import prompt_to_mask, prompt_to_region_indices
 
 
 @torch.inference_mode()
@@ -49,6 +55,13 @@ def main():
         help="config json file that stores training hyper-parameters",
     )
     parser.add_argument("-g", "--gpus", default=1, type=int, help="number of gpus per node")
+    parser.add_argument(
+        "-p",
+        "--prompt",
+        type=str,
+        default=None,
+        help="text prompt used to guide ControlNet instead of label mask",
+    )
 
     args = parser.parse_args()
 
@@ -151,22 +164,31 @@ def main():
     unet.eval()
 
     for batch in val_loader:
-        # get label mask
-        labels = batch["label"].to(device)
-        # get corresponding conditions
-        if include_body_region:
-            top_region_index_tensor = batch["top_region_index"].to(device)
-            bottom_region_index_tensor = batch["bottom_region_index"].to(device)
-        else:
-            top_region_index_tensor = None
-            bottom_region_index_tensor = None
         spacing_tensor = batch["spacing"].to(device)
-        modality_tensor = args.controlnet_infer["modality"] * torch.ones((len(labels),), dtype=torch.long).to(device)
         out_spacing = tuple((batch["spacing"].squeeze().numpy() / 100).tolist())
-        # get target dimension
         dim = batch["dim"]
         output_size = (dim[0].item(), dim[1].item(), dim[2].item())
         latent_shape = (args.latent_channels, output_size[0] // 4, output_size[1] // 4, output_size[2] // 4)
+
+        if args.prompt is not None:
+            labels = prompt_to_mask(args.prompt, output_size).to(device)
+            if include_body_region:
+                top_region_index, bottom_region_index = prompt_to_region_indices(args.prompt)
+                top_region_index_tensor = torch.tensor([top_region_index], device=device)
+                bottom_region_index_tensor = torch.tensor([bottom_region_index], device=device)
+            else:
+                top_region_index_tensor = None
+                bottom_region_index_tensor = None
+        else:
+            labels = batch["label"].to(device)
+            if include_body_region:
+                top_region_index_tensor = batch["top_region_index"].to(device)
+                bottom_region_index_tensor = batch["bottom_region_index"].to(device)
+            else:
+                top_region_index_tensor = None
+                bottom_region_index_tensor = None
+
+        modality_tensor = args.controlnet_infer["modality"] * torch.ones((len(labels),), dtype=torch.long).to(device)
         # check if output_size and out_spacing are valid.
         check_input(None, None, None, output_size, out_spacing, None)
         # generate a single synthetic image using a latent diffusion model with controlnet.
@@ -190,10 +212,13 @@ def main():
             autoencoder_sliding_window_infer_overlap=args.controlnet_infer["autoencoder_sliding_window_infer_overlap"],
         )
         # save image/label pairs
-        labels = decollate_batch(batch)[0]["label"]
+        if args.prompt is None:
+            label_to_save = decollate_batch(batch)[0]["label"]
+        else:
+            label_to_save = MetaTensor(labels.squeeze(0).cpu(), meta={})
         output_postfix = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        labels.meta["filename_or_obj"] = "sample.nii.gz"
-        synthetic_images = MetaTensor(synthetic_images.squeeze(0), meta=labels.meta)
+        label_to_save.meta["filename_or_obj"] = "sample.nii.gz"
+        synthetic_images = MetaTensor(synthetic_images.squeeze(0), meta=label_to_save.meta)
         img_saver = SaveImage(
             output_dir=args.output_dir,
             output_postfix=output_postfix + "_image",
@@ -205,7 +230,7 @@ def main():
             output_postfix=output_postfix + "_label",
             separate_folder=False,
         )
-        label_saver(labels)
+        label_saver(label_to_save)
     if use_ddp:
         dist.destroy_process_group()
 
